@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Run the Scribus engine installed by setup.sh.
+#   sla-engine [--gui] SCRIPT.py [args...]   run a Scribus Python script
+#   sla-engine --shell CMD...                run a command in the engine environment
+#   sla-engine --info                        print engine mode and Scribus version
+#   sla-engine --unmount                     detach the engine root's bind mounts
+# Paths under /home /tmp /mnt /root /opt/sla are identical inside and outside the engine.
+set -euo pipefail
+CONF=/opt/sla/engine.env
+[ -f "$CONF" ] || { echo "Scribus engine not installed. Run: bash $(dirname "$(realpath "$0")")/setup.sh" >&2; exit 3; }
+. "$CONF"; VERSION=${VERSION:-?}
+
+ensure_mounts() {
+  mountpoint -q "$ROOT/proc" || mount -t proc proc "$ROOT/proc"
+  for d in /dev /home /tmp /mnt /root /opt/sla; do
+    [ -d "$d" ] || continue
+    mkdir -p "$ROOT$d"
+    # rslave: unmounting inside the engine root can never unmount the host's own mounts
+    mountpoint -q "$ROOT$d" || { mount --rbind "$d" "$ROOT$d" && mount --make-rslave "$ROOT$d"; }
+  done
+}
+unmount_all() {  # detach every mount under the engine root (needed before deleting it)
+  [ -n "${ROOT:-}" ] && [ -d "$ROOT" ] || return 0
+  local m
+  for m in $(findmnt -rn -o TARGET | grep "^$ROOT/" | sort -r); do umount -l "$m" 2>/dev/null || true; done
+  ! findmnt -rn -o TARGET | grep -q "^$ROOT/"
+}
+inside() {  # run a command in the engine environment, keeping cwd and SLA_* env
+  if [ "$MODE" = chroot ]; then
+    ensure_mounts
+    local cwd; cwd=$(pwd)
+    case "$cwd" in /home/*|/tmp/*|/mnt/*|/root/*|/opt/sla/*|/home|/tmp|/mnt|/root) ;; *) cwd=/tmp;; esac
+    chroot "$ROOT" /usr/bin/env -C "$cwd" HOME=/opt/sla/home LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+      XDG_RUNTIME_DIR=/tmp/sla-xdg QT_QPA_FONTDIR= "$@"
+  else
+    HOME=/opt/sla/home LANG=C.UTF-8 LC_ALL=C.UTF-8 XDG_RUNTIME_DIR=/tmp/sla-xdg "$@"
+  fi
+}
+mkdir -p /tmp/sla-xdg /opt/sla/home && chmod 700 /tmp/sla-xdg
+
+case "${1:-}" in
+  --info)  echo "mode=$MODE version=$VERSION scribus=$SCRIBUS${ROOT:+ root=$ROOT}"; exit 0;;
+  --shell) shift; inside "$@"; exit $?;;
+  --unmount) unmount_all && echo "unmounted" || { echo "mounts remain under $ROOT" >&2; exit 1; }; exit 0;;
+esac
+GUI=-g
+[ "${1:-}" = --gui ] && { GUI=; shift; }
+script=$(realpath "$1"); shift
+# -ns no splash, -g no GUI window (documents still lay out fully), isolated prefs dir.
+inside xvfb-run -a -s "-screen 0 1600x1200x24" timeout "${SLA_TIMEOUT:-600}" \
+  "$SCRIBUS" $GUI -ns -pr "${SLA_PREFS:-/opt/sla/home/prefs}" -py "$script" "$@"

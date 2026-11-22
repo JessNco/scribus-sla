@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""sla - work with Scribus .sla files using the real Scribus engine.
+
+  sla info                          engine + version
+  sla inspect FILE.sla [--json]     pages, fonts (and whether installed), images (and whether found),
+                                    named items, {{placeholders}}, form fields
+  sla export FILE.sla [options]     PDF / PNG / JPG / SVG / EPS / PS / print PDF
+  sla fill TEMPLATE.sla OUT.sla ... replace {{placeholders}}, named-frame text, images
+  sla resave IN.sla OUT.sla         open in Scribus and save (normalises a hand-written file)
+  sla run SCRIPT.py [args]          run a Scribus Python (scripter) script in the engine
+  sla compare A.pdf B.pdf [...]     pixel comparison (see sla-compare --help)
+  sla fonts [--add FILE_OR_DIR...] [--google FAMILY]   list fonts Scribus sees / install more
+
+Run "sla <command> -h" for the options of a command.
+"""
+import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile
+import xml.etree.ElementTree as ET
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ENGINE = os.path.join(HERE, "sla-engine")
+JOB = os.path.join(HERE, "..", "inside", "job.py")
+FONTDIR = "/opt/sla/fonts"
+FONTCACHE = "/opt/sla/fontnames.json"
+SHARED = ("/home/", "/tmp/", "/mnt/", "/root/", "/opt/sla/")
+
+
+def die(msg, code=2):
+    print("sla: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def need_shared(path):
+    p = os.path.realpath(path)
+    if not p.startswith(SHARED):
+        die(f"{p} is outside the folders the engine can see ({', '.join(SHARED)}). Copy it under /tmp or /home.")
+    return p
+
+
+def engine(args, quiet=True, timeout=None):
+    env = dict(os.environ)
+    if timeout:
+        env["SLA_TIMEOUT"] = str(timeout)
+    r = subprocess.run([ENGINE] + args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    if not quiet:
+        sys.stderr.write(r.stdout)
+    return r
+
+
+def form_prefs(job):
+    """Documents with PDF form fields: the desktop export dialog embeds the fields' fonts in full.
+    Scribus flags big fonts (>2048 glyphs) as subset-only and the scripter cannot override that,
+    which makes the export crash. Clear the flag for exactly those fonts via a private prefs dir."""
+    probe = dict(job, outputs=[], probe_form_fonts=True)
+    fonts = run_job(probe, _plain=True).get("form_fonts", [])
+    if not fonts:
+        return None
+    import hashlib
+    from xml.sax.saxutils import quoteattr
+    d = "/opt/sla/home/prefs-form-" + hashlib.sha1("|".join(fonts).encode()).hexdigest()[:10]
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "scribus150.rc"), "w") as fh:
+        fh.write('<SCRIBUSRC VERSION="1.5.0">\n' + "".join(
+            f' <Font Name={quoteattr(f)} Embed="1" Use="1" Subset="0"/>\n' for f in fonts) + "</SCRIBUSRC>\n")
+    return d
+
+
+def run_job(job, timeout=None, _plain=False):
+    if not _plain and job.get("annotation_items") and any(o["type"] == "pdf" and o.get("options", {}).get("fontEmbedding", 0) == 0 for o in job["outputs"]):
+        prefs = form_prefs(job)
+        if prefs:
+            os.environ["SLA_PREFS"] = prefs
+    with tempfile.TemporaryDirectory(prefix="sla-job-", dir="/tmp") as tmp:
+        job["result"] = os.path.join(tmp, "result.json")
+        jf = os.path.join(tmp, "job.json")
+        with open(jf, "w") as fh:
+            json.dump(job, fh)
+        r = engine([JOB, jf], timeout=timeout)
+        if not os.path.exists(job["result"]):
+            tail = "\n".join(r.stdout.splitlines()[-15:])
+            die(f"Scribus exited (code {r.returncode}) without finishing the job - it probably crashed.\n{tail}", 1)
+        with open(job["result"]) as fh:
+            res = json.load(fh)
+        if not res.get("ok"):
+            die("Scribus reported: " + res.get("error", "unknown error") + "\n" + res.get("trace", ""), 1)
+        return res
+
+
+# ---------------------------------------------------------------- fonts
+def font_dirs_stamp():
+    stamp = [(open("/opt/sla/engine.env").read() if os.path.exists("/opt/sla/engine.env") else "", 0)]
+    for d in (FONTDIR,):
+        for root, _, files in os.walk(d):
+            for f in files:
+                p = os.path.join(root, f)
+                stamp.append((p, os.path.getmtime(p)))
+    return sorted(stamp)
+
+
+def engine_fonts(refresh=False):
+    stamp = json.loads(json.dumps(font_dirs_stamp()))
+    if not refresh and os.path.exists(FONTCACHE):
+        with open(FONTCACHE) as fh:
+            c = json.load(fh)
+        if c.get("stamp") == stamp:
+            return c["fonts"]
+    with tempfile.TemporaryDirectory(prefix="sla-fonts-", dir="/tmp") as tmp:
+        out = os.path.join(tmp, "f.json")
+        sc = os.path.join(tmp, "f.py")
+        with open(sc, "w") as fh:
+            fh.write("import scribus, json, os\ntry:\n json.dump(sorted(scribus.getFontNames()), open(%r, 'w'))\nfinally:\n os._exit(0)\n" % out)
+        engine(["--shell", "fc-cache", "-f"])
+        engine([sc])
+        if not os.path.exists(out):
+            die("could not read the font list from Scribus", 1)
+        with open(out) as fh:
+            fonts = json.load(fh)
+    with open(FONTCACHE, "w") as fh:
+        json.dump({"stamp": stamp, "fonts": fonts}, fh)
+    return fonts
+
+
+def google_font(family):
+    """Download a family from the google/fonts GitHub repository (open-licensed fonts only)."""
+    slug = re.sub(r"[^a-z0-9]", "", family.lower())
+    base = "https://raw.githubusercontent.com/google/fonts/main/"
+    for lic in ("ofl", "apache", "ufl"):
+        r = subprocess.run(["curl", "-sfL", f"{base}{lic}/{slug}/METADATA.pb"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout:
+            files = re.findall(r'filename:\s*"([^"]+)"', r.stdout)
+            os.makedirs(FONTDIR, exist_ok=True)
+            for f in files:
+                subprocess.run(["curl", "-sfL", "-o", os.path.join(FONTDIR, f), f"{base}{lic}/{slug}/" + f.replace("[", "%5B").replace("]", "%5D")], check=True)
+            print(f"installed {family}: {', '.join(files)}")
+            return True
+    print(f"could not download '{family}' from github.com/google/fonts (not there, or the network blocks it). Ask the user for the font files and use: sla fonts --add FILE")
+    return False
+
+
+def cmd_fonts(a):
+    for fam in a.google or []:
+        google_font(fam)
+    if a.add:
+        os.makedirs(FONTDIR, exist_ok=True)
+        n = 0
+        for src in a.add:
+            files = [src] if os.path.isfile(src) else [p for e in ("ttf", "otf", "ttc", "TTF", "OTF") for p in glob.glob(os.path.join(src, "**", "*." + e), recursive=True)]
+            for f in files:
+                shutil.copy2(f, FONTDIR); n += 1
+        print(f"installed {n} font file(s) into {FONTDIR}")
+    fonts = engine_fonts(refresh=bool(a.add or a.google))
+    pat = (a.grep or "").lower()
+    for f in fonts:
+        if pat in f.lower():
+            print(f)
+
+
+# ---------------------------------------------------------------- inspect
+def load(path):
+    try:
+        if path.endswith(".gz"):      # Scribus also reads gzipped documents (.sla.gz)
+            import gzip
+            with gzip.open(path) as fh:
+                return ET.parse(fh)
+        return ET.parse(path)
+    except ET.ParseError as e:
+        die(f"{path} is not well-formed XML: {e}")
+
+
+def story_text(el):
+    st = el.find("StoryText")
+    if st is None:
+        return ""
+    out = []
+    for c in st:
+        if c.tag == "ITEXT":
+            out.append(c.get("CH", ""))
+        elif c.tag in ("para", "breakline"):
+            out.append("\n")
+        elif c.tag == "tab":
+            out.append("\t")
+    return "".join(out)
+
+
+def inspect(path):
+    tree = load(path); root = tree.getroot(); doc = root.find("DOCUMENT")
+    if root.tag != "SCRIBUSUTF8NEW" or doc is None:
+        die(f"{path} is not a Scribus 1.5/1.6 document (root element {root.tag})")
+    base = os.path.dirname(os.path.realpath(path))
+    pages = doc.findall("PAGE")
+    fonts = {}
+    for el in doc.iter():
+        f = el.get("FONT")
+        if f:
+            fonts[f] = fonts.get(f, 0) + 1
+    images, items, fields, annots = [], [], 0, []
+    placeholders = set()
+    for tag in ("PAGEOBJECT", "MASTEROBJECT", "FRAMEOBJECT"):
+        for el in doc.iter(tag):
+            pt = el.get("PTYPE")
+            if pt == "2":
+                pf = el.get("PFILE", "")
+                inline = el.get("isInlineImage") == "1"
+                found = inline or (bool(pf) and os.path.exists(os.path.join(base, pf)))
+                if pf or inline:
+                    images.append({"item": el.get("ANNAME", ""), "file": "(embedded)" if inline else pf, "found": found,
+                                   "fit_to_frame": el.get("SCALETYPE") == "0", "master": tag == "MASTEROBJECT"})
+            txt = story_text(el)
+            placeholders.update(re.findall(r"\{\{\s*([\w.\- ]+?)\s*\}\}", txt))
+            if el.get("ANNOTATION") == "1":
+                fields += 1
+                if el.get("PTYPE") == "4" and el.get("ANNAME") and (el.get("ANTYPE") in ("2", "3", "5", "6") or txt):
+                    annots.append({"name": el.get("ANNAME"), "master": el.get("OnMasterPage", "") if tag == "MASTEROBJECT" else ""})
+            if el.get("ANNAME"):
+                items.append({"name": el.get("ANNAME"), "type": {"2": "image", "4": "text", "5": "line", "6": "shape", "7": "polyline", "12": "group", "16": "table"}.get(pt, pt),
+                              "page": int(el.get("OwnPage", "-1")) + 1, "master": tag == "MASTEROBJECT", "text": txt[:60]})
+    try:
+        have = set(engine_fonts())
+    except SystemExit:
+        have = None
+    return {
+        "file": path, "version": root.get("Version"),
+        "pages": len(pages),
+        "page_size_pt": sorted({(round(float(p.get("PAGEWIDTH")), 2), round(float(p.get("PAGEHEIGHT")), 2)) for p in pages}),
+        "master_pages": [m.get("NAM") for m in doc.findall("MASTERPAGE")],
+        "layers": [l.get("NAME") for l in doc.findall("LAYERS")],
+        "fonts": [{"name": f, "uses": n, "installed": (f in have) if have is not None else None} for f, n in sorted(fonts.items())],
+        "images": images, "named_items": items, "placeholders": sorted(placeholders), "form_fields": fields,
+        "color_management": doc.get("DPuse") == "1", "_annotation_items": annots,
+    }
+
+
+def problems(info):
+    out = []
+    for f in info["fonts"]:
+        if f["installed"] is False:
+            out.append(f"MISSING FONT: {f['name']} ({f['uses']} uses) - Scribus will silently substitute it; install it with: sla fonts --add FILE")
+    for i in info["images"]:
+        if not i["found"]:
+            out.append(f"MISSING IMAGE: {i['file']} (frame {i['item'] or '?'}) - the frame will export empty")
+    return out
+
+
+def cmd_inspect(a):
+    info = inspect(a.file)
+    info.pop("_annotation_items")
+    info["problems"] = problems(info)
+    if a.json:
+        print(json.dumps(info, indent=1)); return
+    print(f"{info['file']}: Scribus {info['version']} document, {info['pages']} page(s), sizes {info['page_size_pt']} pt")
+    print(f"master pages: {info['master_pages']}  layers: {info['layers']}  form fields: {info['form_fields']}  colour management: {info['color_management']}")
+    print("fonts:")
+    for f in info["fonts"]:
+        print(f"  {'ok     ' if f['installed'] else 'MISSING' if f['installed'] is False else '?      '} {f['name']} ({f['uses']})")
+    print(f"images: {len(info['images'])} ({sum(1 for i in info['images'] if not i['found'])} missing)")
+    for i in info["images"]:
+        if not i["found"] or a.verbose:
+            print(f"  {'ok     ' if i['found'] else 'MISSING'} {i['file']}  [{i['item']}]")
+    if info["placeholders"]:
+        print("placeholders: " + ", ".join("{{%s}}" % p for p in info["placeholders"]))
+    if a.verbose:
+        print("named items:")
+        for it in info["named_items"]:
+            print(f"  p{it['page']:<3} {it['type']:<6} {it['name']!r} {it['text']!r}")
+    for p in info["problems"]:
+        print(p)
+
+
+# ---------------------------------------------------------------- export
+PDF_VERSIONS = {"1.3": 13, "1.4": 14, "1.5": 15, "1.6": 16, "x1a": 11, "x3": 12, "x4": 10}
+
+
+def parse_value(v):
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    try:
+        return int(v)
+    except ValueError:
+        try:
+            return float(v)
+        except ValueError:
+            return v
+
+
+def prepare_for_print(src, tmpdir, profile):
+    """Copy the SLA next to the original with colour management switched on (needed for PDF/X)."""
+    tree = load(src); doc = tree.getroot().find("DOCUMENT")
+    doc.set("DPuse", "1")
+    if profile:
+        doc.set("DPPr", profile)
+    pdf = doc.find("PDF")
+    if pdf is not None and profile:
+        pdf.set("PrintP", profile)
+    out = os.path.join(os.path.dirname(os.path.realpath(src)), ".sla-print-%d.sla" % os.getpid())
+    tree.write(out, encoding="UTF-8", xml_declaration=True)
+    return out
+
+
+def cmd_export(a):
+    src = need_shared(a.file)
+    info = inspect(src)
+    probs = problems(info)
+    for p in probs:
+        print(p, file=sys.stderr)
+    if probs and not a.allow_missing:
+        die("refusing to export with missing fonts/images (the result would not match the desktop app). Fix them or pass --allow-missing.", 4)
+    stem = re.sub(r"\.sla(\.gz)?$", "", os.path.basename(src))
+    outdir = need_shared(a.outdir or os.path.dirname(src)); os.makedirs(outdir, exist_ok=True)
+    want = set(a.formats.split(","))
+    bad = want - {"pdf", "png", "jpg", "tiff", "svg", "eps", "ps"}
+    if bad:
+        die("unknown format(s): " + ",".join(sorted(bad)))
+    opts = {}
+    if a.lossless: opts["compressmtd"] = 2
+    if a.outline_fonts: opts["fontEmbedding"] = 1
+    if a.pdf_version:
+        if a.pdf_version not in PDF_VERSIONS: die("pdf version must be one of " + ", ".join(PDF_VERSIONS))
+        opts["version"] = PDF_VERSIONS[a.pdf_version]
+    if a.crop_marks: opts["cropMarks"] = True
+    if a.bleed is not None:
+        opts.update(useDocBleeds=False, bleedt=a.bleed, bleedb=a.bleed, bleedl=a.bleed, bleedr=a.bleed)
+    if a.doc_bleed: opts["useDocBleeds"] = True
+    if a.cmyk or (a.pdf_version or "").startswith("x"):
+        opts["outdst"] = 1  # printer / CMYK
+    if a.gray: opts["isGrayscale"] = True
+    if (a.pdf_version or "").startswith("x"):
+        opts["info"] = a.info or stem
+        if a.pdf_version in ("x1a", "x3"):
+            opts["fontEmbedding"] = opts.get("fontEmbedding", 0)
+    for kv in a.pdf_option or []:
+        k, _, v = kv.partition("=")
+        opts[k] = parse_value(v)
+    work_src, cleanup = src, None
+    if (a.pdf_version or "").startswith("x") or a.profile:
+        work_src = cleanup = prepare_for_print(src, None, a.profile)
+        if a.profile: opts["printprofc"] = a.profile
+    need_pdf = want & {"pdf", "svg", "ps"} or a.raster_via == "pdf" and want & {"png", "jpg", "tiff"}
+    tmp = tempfile.mkdtemp(prefix="sla-exp-", dir="/tmp")
+    pdf_path = a.output if (a.output and "pdf" in want) else os.path.join(outdir if "pdf" in want else tmp, stem + ".pdf")
+    pdf_path = need_shared(pdf_path)
+    job = {"input": work_src, "outputs": [], "annotation_items": info["_annotation_items"]}
+    if need_pdf:
+        o = {"type": "pdf", "file": pdf_path, "options": opts}
+        if a.pages: o["pages"] = a.pages
+        job["outputs"].append(o)
+    native_raster = [f for f in ("png", "jpg", "tiff") if f in want] if a.raster_via == "scribus" else []
+    for f in native_raster:
+        job["outputs"].append({"type": f, "pattern": os.path.join(outdir, stem + "-%03d." + f), "dpi": a.dpi, "pages": a.pages,
+                               "transparent": a.transparent, "quality": a.quality})
+    if "eps" in want:
+        job["outputs"].append({"type": "eps", "pattern": os.path.join(outdir, stem + "-%03d.eps"), "pages": a.pages})
+    try:
+        res = run_job(job, timeout=a.timeout)
+    finally:
+        if cleanup and os.path.exists(cleanup): os.remove(cleanup)
+    made = [p for p in res["outputs"] if p.startswith(outdir) or p == pdf_path and "pdf" in want]
+    for p in res["outputs"]:
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            die(f"Scribus did not produce {p}", 1)
+    if need_pdf:
+        if "svg" in want:   # one SVG per page, converted from the exported PDF (vector, fonts as outlines)
+            n = int(re.search(r"Pages:\s+(\d+)", subprocess.run(["pdfinfo", pdf_path], capture_output=True, text=True).stdout).group(1))
+            for i in range(1, n + 1):
+                out = os.path.join(outdir, f"{stem}-{i:03d}.svg")
+                subprocess.run(["pdftocairo", "-svg", "-f", str(i), "-l", str(i), pdf_path, out], check=True); made.append(out)
+        if "ps" in want:
+            out = os.path.join(outdir, stem + ".ps")
+            subprocess.run(["pdftops", "-level3", pdf_path, out], check=True); made.append(out)
+        if a.raster_via == "pdf":
+            for f in ("png", "jpg", "tiff"):
+                if f in want:
+                    flag = {"png": "-png", "jpg": "-jpeg", "tiff": "-tiff"}[f]
+                    before = set(glob.glob(os.path.join(outdir, stem + "-*")))
+                    subprocess.run(["pdftoppm", "-r", str(a.dpi), flag, pdf_path, os.path.join(outdir, stem)], check=True)
+                    made += sorted(set(glob.glob(os.path.join(outdir, stem + "-*"))) - before)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"exported {info['pages']} page(s) with Scribus {res.get('scribus') or '?'}:")
+    for p in made:
+        print("  " + p)
+
+
+# ---------------------------------------------------------------- fill
+def set_frame_text(el, value):
+    st = el.find("StoryText")
+    if st is None:
+        return False
+    keep_default = st.find("DefaultStyle")
+    first = st.find("ITEXT")
+    attrs = dict(first.attrib) if first is not None else {}
+    para = st.find("para"); trail = st.find("trail")
+    pattrs = dict(para.attrib) if para is not None else (dict(trail.attrib) if trail is not None else {})
+    for c in list(st):
+        st.remove(c)
+    if keep_default is not None:
+        st.append(keep_default)
+    lines = value.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            attrs["CH"] = line
+            ET.SubElement(st, "ITEXT", attrs)
+        if i < len(lines) - 1:
+            ET.SubElement(st, "para", pattrs)
+    if trail is not None:
+        st.append(trail)
+    return True
+
+
+def cmd_fill(a):
+    data = {"placeholders": {}, "text": {}, "images": {}}
+    if a.data:
+        with open(a.data) as fh:
+            d = json.load(fh)
+        for k in data:
+            data[k].update(d.get(k, {}))
+    for kv in a.set or []:
+        k, _, v = kv.partition("="); data["placeholders"][k] = v
+    for kv in a.text or []:
+        k, _, v = kv.partition("="); data["text"][k] = v
+    for kv in a.image or []:
+        k, _, v = kv.partition("="); data["images"][k] = v
+    tree = load(a.template); doc = tree.getroot().find("DOCUMENT")
+    outdir = os.path.dirname(os.path.realpath(a.out))
+    srcdir = os.path.dirname(os.path.realpath(a.template))
+    used = {k: 0 for g in data.values() for k in g}
+    for tag in ("PAGEOBJECT", "MASTEROBJECT", "FRAMEOBJECT"):
+        for el in doc.iter(tag):
+            name = el.get("ANNAME", "")
+            if name in data["text"] and el.get("PTYPE") == "4":
+                if set_frame_text(el, data["text"][name].replace("\\n", "\n")): used[name] += 1
+            st = el.find("StoryText")
+            if st is not None and data["placeholders"]:
+                for it in st.findall("ITEXT"):
+                    ch = it.get("CH", "")
+                    for k, v in data["placeholders"].items():
+                        new, n = re.subn(r"\{\{\s*" + re.escape(k) + r"\s*\}\}", lambda m: v, ch)
+                        if n: ch = new; used[k] += n
+                    it.set("CH", ch)
+            if el.get("PTYPE") == "2":
+                pf = el.get("PFILE", "")
+                key = name if name in data["images"] else pf if pf in data["images"] else os.path.basename(pf) if os.path.basename(pf) in data["images"] else None
+                if key:
+                    new = os.path.realpath(data["images"][key])
+                    if not os.path.exists(new): die(f"image not found: {new}")
+                    el.set("PFILE", os.path.relpath(new, outdir)); el.set("isInlineImage", "0"); used[key] += 1
+                    if not a.keep_image_scale:
+                        # free-scaled frames keep the OLD image's scale factors; fit-to-frame makes
+                        # Scribus rescale the new image to the frame (proportions as the frame says)
+                        el.set("SCALETYPE", "0")
+                elif pf and outdir != srcdir and not os.path.isabs(pf):
+                    el.set("PFILE", os.path.relpath(os.path.join(srcdir, pf), outdir))   # keep links valid from the new folder
+    tree.write(a.out, encoding="UTF-8", xml_declaration=True)
+    for k, n in used.items():
+        print(f"  {k}: {n} replacement(s)" + ("   <-- NOT FOUND in the template" if n == 0 else ""))
+    left = inspect(a.out)["placeholders"]
+    if left:
+        print("unfilled placeholders remain: " + ", ".join(left))
+    if not a.no_resave:   # let Scribus itself write the final file so it is a genuine Scribus save
+        tmp = a.out + ".tmp.sla"; os.replace(a.out, tmp)
+        try:
+            run_job({"input": need_shared(tmp), "outputs": [{"type": "sla", "file": need_shared(a.out)}]})
+        finally:
+            if os.path.exists(tmp): os.remove(tmp)
+    print("wrote " + a.out)
+    if any(n == 0 for n in used.values()) and a.strict:
+        sys.exit(5)
+
+
+def cmd_resave(a):
+    run_job({"input": need_shared(a.infile), "outputs": [{"type": "sla", "file": need_shared(a.out)}]})
+    print("wrote " + a.out)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        sys.exit(subprocess.run([ENGINE] + sys.argv[2:]).returncode)
+    if len(sys.argv) > 1 and sys.argv[1] == "compare":
+        sys.exit(subprocess.run([sys.executable, os.path.join(HERE, "sla-compare")] + sys.argv[2:]).returncode)
+    if len(sys.argv) > 1 and sys.argv[1] == "info":
+        sys.exit(subprocess.run([ENGINE, "--info"]).returncode)
+    ap = argparse.ArgumentParser(prog="sla", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("inspect"); p.add_argument("file"); p.add_argument("--json", action="store_true"); p.add_argument("-v", "--verbose", action="store_true"); p.set_defaults(fn=cmd_inspect)
+    p = sub.add_parser("fonts"); p.add_argument("--add", nargs="+", help="font files or folders to install"); p.add_argument("--google", action="append", metavar="FAMILY", help="download an open-licensed family from Google Fonts, e.g. --google \"Comic Relief\""); p.add_argument("--grep", help="only list names containing this text"); p.set_defaults(fn=cmd_fonts)
+    p = sub.add_parser("export", description="Export with the document's own saved PDF settings unless options override them.")
+    p.add_argument("file")
+    p.add_argument("-f", "--formats", default="pdf", help="comma list: pdf,png,jpg,tiff,svg,eps,ps (default pdf)")
+    p.add_argument("-o", "--output", help="PDF output path (default: next to the .sla)")
+    p.add_argument("-d", "--outdir", help="folder for the outputs (default: next to the .sla)")
+    p.add_argument("--pages", help="e.g. 1,3-5 (default all)")
+    p.add_argument("--dpi", type=int, default=300, help="raster resolution (default 300)")
+    p.add_argument("--raster-via", choices=["scribus", "pdf"], default="scribus", help="scribus = File > Export > Save as Image; pdf = rasterise the exported PDF")
+    p.add_argument("--transparent", action="store_true", help="PNG with transparent page background")
+    p.add_argument("--quality", type=int, default=95)
+    p.add_argument("--lossless", action="store_true", help="zip-compress images in the PDF instead of the document's setting")
+    p.add_argument("--outline-fonts", action="store_true", help="convert text to outlines (needed for documents with PDF form fields)")
+    p.add_argument("--pdf-version", help="1.3 1.4 1.5 1.6 x1a x3 x4")
+    p.add_argument("--cmyk", action="store_true", help="output intended for printer (CMYK)")
+    p.add_argument("--gray", action="store_true")
+    p.add_argument("--profile", help="CMYK ICC profile description as Scribus lists it, e.g. 'ISO Coated v2 300% (basICColor)'")
+    p.add_argument("--info", help="PDF/X info string")
+    p.add_argument("--crop-marks", action="store_true"); p.add_argument("--bleed", type=float, help="bleed on all sides in pt"); p.add_argument("--doc-bleed", action="store_true")
+    p.add_argument("--pdf-option", action="append", metavar="KEY=VALUE", help="any scribus.PDFfile attribute, repeatable")
+    p.add_argument("--allow-missing", action="store_true", help="export even when fonts or images are missing")
+    p.add_argument("--timeout", type=int, default=600)
+    p.set_defaults(fn=cmd_export)
+    p = sub.add_parser("fill", description="Fill a template. Placeholders are {{name}} in the template text.")
+    p.add_argument("template"); p.add_argument("out")
+    p.add_argument("--data", help='JSON: {"placeholders":{}, "text":{}, "images":{}}')
+    p.add_argument("--set", action="append", metavar="NAME=VALUE", help="replace {{NAME}}")
+    p.add_argument("--text", action="append", metavar="ITEM=VALUE", help="replace the whole text of the frame named ITEM (\\n = new paragraph)")
+    p.add_argument("--image", action="append", metavar="ITEM_OR_OLDFILE=NEWFILE", help="relink an image frame")
+    p.add_argument("--keep-image-scale", action="store_true", help="keep a relinked frame's saved scale/offset instead of fitting the new image to the frame")
+    p.add_argument("--no-resave", action="store_true"); p.add_argument("--strict", action="store_true", help="exit 5 if a key matched nothing")
+    p.set_defaults(fn=cmd_fill)
+    p = sub.add_parser("resave"); p.add_argument("infile"); p.add_argument("out"); p.set_defaults(fn=cmd_resave)
+    a = ap.parse_args(); a.fn(a)
+
+main()
