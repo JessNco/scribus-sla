@@ -27,6 +27,7 @@ PY
 creator_version() { local t; t=$(ls -t /tmp/sla-smoke.*/s.pdf 2>/dev/null | head -1); pdfinfo "$t" 2>/dev/null | sed -n 's/^Creator: *Scribus *//p'; }
 
 if [ -f /opt/sla/engine.env ] && grep -q "^WANT=$WANT$" /opt/sla/engine.env && smoke; then
+  for t in sla sla-compare sla-engine; do ln -sf "$HERE/$t" /usr/local/bin/$t 2>/dev/null || true; done
   say "engine already installed: $("$HERE/sla-engine" --info)"; exit 0
 fi
 
