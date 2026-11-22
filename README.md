@@ -55,3 +55,7 @@ and PDF/X output works but was not compared against desktop-made files.
 - Documents with PDF form fields: the tool embeds the field font in full, as the desktop export
   dialog does. Plain scripted export crashes on these.
 - SVG and PS are converted from the exported PDF. PNG/JPG come from Scribus's own image export.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
